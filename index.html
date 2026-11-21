@@ -493,13 +493,20 @@ function cloudSetSynced(sha){
   lastSeenCases=cloudString();persistCloudMeta();
   cloudMessage('GitHub ile eşitlendi.');
 }
+function cloudHeaders(authorized=false){
+  const h={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'};
+  if(authorized && CLOUD.token)h['Authorization']='Bearer '+CLOUD.token;
+  return h;
+}
 async function cloudRead(){
+  // The read MUST address the same branch and use the same access credentials as the write.
+  // Otherwise a 404 may be interpreted as "new file" and a PUT without sha is rejected.
   const u=cloudUrl()+`?ref=${encodeURIComponent(CLOUD.branch)}`;
-  const resp=await fetch(u,{headers:{'Accept':'application/vnd.github+json'},cache:'no-store'});
+  const resp=await fetch(u,{headers:cloudHeaders(true),cache:'no-store'});
   if(resp.status===404)return null;
   if(!resp.ok)throw new Error('GitHub verileri okunamadı (HTTP '+resp.status+').');
   const info=await resp.json();
-  if(info.type!=='file'||typeof info.content!=='string')throw new Error('GitHub dosyası beklenen JSON biçiminde değil.');
+  if(info.type!=='file'||typeof info.content!=='string'||!info.sha)throw new Error('GitHub dosyası veya SHA bilgisi bulunamadı.');
   const obj=JSON.parse(cloudDecode(info.content));
   if(!obj||!Array.isArray(obj.cases)||obj.cases.some(c=>!c||typeof c.id!=='string'||!Array.isArray(c.events)))throw new Error('GitHub verisi İlişki Atlası biçiminde değil.');
   return {sha:info.sha,data:obj};
@@ -543,7 +550,7 @@ async function cloudPush(manual=true){
   if(CLOUD.working)return;
   CLOUD.working=true;cloudMessage('GitHub\'a kayıt gönderiliyor...');
   try{
-    const before=await cloudRead();
+    let before=await cloudRead();
     const local=cloudString();
     const server=before?JSON.stringify(before.data.cases):null;
     if(before && server===local){cloudSetSynced(before.sha);if(manual)toast('GitHub verileri zaten güncel.');return}
@@ -558,10 +565,30 @@ async function cloudPush(manual=true){
     const payload={app:'iliski-atlasi',version:1,syncedAt:new Date().toISOString(),cases:state.cases};
     const req={message:'İlişki Atlası kayıtlarını eşitle: '+new Date().toISOString(),content:cloudEncode(JSON.stringify(payload)),branch:CLOUD.branch};
     if(before)req.sha=before.sha;
-    const resp=await fetch(cloudUrl(),{
-      method:'PUT',headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+CLOUD.token,'Content-Type':'application/json'},
+    const write=()=>fetch(cloudUrl(),{
+      method:'PUT',headers:{...cloudHeaders(true),'Content-Type':'application/json'},
       body:JSON.stringify(req)
     });
+    let resp=await write();
+    // A previous/parallel write may have created the file after our first read.
+    // Re-read to obtain the CURRENT SHA; never retry blindly over another device's data.
+    if(resp.status===422){
+      let failure='';
+      try{failure=(await resp.clone().json()).message||''}catch(err){}
+      if(/sha.*(wasn't supplied|is missing|required)|\"sha\"/i.test(failure)){
+        const latest=await cloudRead();
+        if(!latest){throw new Error('GitHub bir SHA istiyor ama veriler dalındaki dosya okunamıyor. GitHub > veriler > iliski_atlasi_kayitlari.json yolunu kontrol edin.');}
+        if(JSON.stringify(latest.data.cases)===local){cloudSetSynced(latest.sha);if(manual)toast('GitHub verileri zaten güncel.');return}
+        if(!manual){CLOUD.conflict=true;cloudMessage('Çakışma: GitHub kayıtları değişmiş. Manuel kontrol gerekli.');return}
+        if(!before || latest.sha!==before.sha){
+          if(!confirm('GitHub\'daki JSON dosyası zaten mevcut ve bu cihazdakinden farklı.\n\nGitHub verisinin üzerine bu cihazın kayıtları yazılsın mı?')){
+            cloudMessage('GitHub verileri değiştirilmedi.');return;
+          }
+        }
+        req.sha=latest.sha;
+        resp=await write();
+      }
+    }
     if(!resp.ok){
       let message='HTTP '+resp.status;
       try{const response=await resp.json();message=response.message||message}catch(err){}
